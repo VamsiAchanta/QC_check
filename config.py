@@ -8,9 +8,9 @@ CONFIG = {
     # ---- 2. Manufacturer Information ----
     "manufacturer_name": "Medtronic Navigation, Inc.",
     "manufacturer_address": "200 Medtronic Drive, Lafayette, Colorado 80026, USA",
-    # Not visible in the reference page provided — set these if your
-    # documents include them; leave as None to skip that check.
-    "ec_rep_address": None,
+    # Not visible in the reference page provided — set this if your
+    # documents include it; leave as None to skip that check.
+    "ec_rep_address": "Medtronic B.V., Earl Bakkenstraat 10, 6422 PJ Heerlen, Netherlands",
     "importer_address": None,
 
     # Where manufacturer info is required to appear in the PDF:
