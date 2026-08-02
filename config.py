@@ -20,8 +20,20 @@ CONFIG = {
     "manufacturer_info_page": "last",
 
     # ---- 1. Page Number Verification ----
-    # Pattern used to find "Page X of Y" style footers/headers.
+    # "labeled"     -> pages show "Page X of Y" style text
+    # "bare_number" -> pages show just a standalone number (no "Page"/"of")
+    "page_number_mode": "bare_number",
+
+    # Only used when page_number_mode == "labeled"
     "page_number_pattern": r"Page\s+(\d+)\s+of\s+(\d+)",
+    # Only used when page_number_mode == "bare_number": max digit length
+    # a page number can be, to avoid false-matching unrelated numbers.
+    "bare_number_max_digits": 4,
+
+    # Pages allowed to have NO printed page number at all (e.g. a cover
+    # page or a manufacturer/back-cover page commonly aren't numbered).
+    # Accepts "first", "last", or specific 1-indexed page ints.
+    "unnumbered_pages": ["first", "last"],
 
     # Left/right placement rule: ODD page numbers must appear in the
     # footer on the RIGHT side of the page; EVEN page numbers must

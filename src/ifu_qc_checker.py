@@ -199,7 +199,6 @@ class IFUQualityChecker:
         self.pages_text = []
         self.pages_words = []   # list of word-dict lists (x0,x1,top,bottom,text)
         self.pages_size = []    # list of (width, height)
-        self._page_number_matches = {}
         self._load()
 
     def _load(self):
@@ -228,38 +227,128 @@ class IFUQualityChecker:
             line.sort(key=lambda w: w["x0"])
         return lines
 
+    def _resolve_unnumbered_pages(self, total_pages):
+        """Turn config's unnumbered_pages list (which may contain 'first'/
+        'last'/ints) into a concrete set of 1-indexed physical page numbers
+        that are allowed to have no printed page number (e.g. cover, back
+        cover)."""
+        resolved = set()
+        for p in self.config.get("unnumbered_pages", []):
+            if p == "last":
+                resolved.add(total_pages)
+            elif p == "first":
+                resolved.add(1)
+            elif isinstance(p, int):
+                resolved.add(p)
+        return resolved
+
     # ------------------------------------------------------
     # 1. Page Number Verification
     # ------------------------------------------------------
+    def _detect_page_numbers(self):
+        """
+        Unified page-number detection supporting two document styles:
+          - "labeled"     -> "Page X of Y" (or similar) found via regex
+                             on full page text
+          - "bare_number" -> just a standalone digit in the footer zone
+                             (no "Page"/"of" wording), located via word
+                             coordinates
+
+        Returns (and caches) {idx: {"num", "raw", "total"(optional),
+        "x0","x1","top","page_width","page_height"}}.
+        """
+        if hasattr(self, "_page_number_info"):
+            return self._page_number_info
+
+        mode = self.config.get("page_number_mode", "labeled")
+        info = {}
+
+        if mode == "bare_number":
+            max_digits = self.config.get("bare_number_max_digits", 4)
+            footer_zone_ratio = self.config.get("footer_zone_ratio", 0.85)
+            digit_re = re.compile(r"\d{1," + str(max_digits) + "}")
+
+            for idx, words in enumerate(self.pages_words, start=1):
+                page_width, page_height = self.pages_size[idx - 1]
+                candidates = [
+                    w for w in words
+                    if digit_re.fullmatch(w["text"])
+                    and w["top"] >= page_height * footer_zone_ratio
+                ]
+                if not candidates:
+                    continue
+                # Prefer the candidate closest to a page edge (left or
+                # right margin) — real page numbers sit near the edge,
+                # not in the middle of the footer.
+                best = min(
+                    candidates,
+                    key=lambda w: min(w["x0"], page_width - w["x1"])
+                )
+                info[idx] = {
+                    "num": int(best["text"]), "raw": best["text"],
+                    "x0": best["x0"], "x1": best["x1"], "top": best["top"],
+                    "page_width": page_width, "page_height": page_height,
+                }
+        else:
+            pattern = self.config["page_number_pattern"]
+            for idx, text in enumerate(self.pages_text, start=1):
+                match = re.search(pattern, text)
+                if not match:
+                    continue
+                num, total = int(match.group(1)), int(match.group(2))
+                page_width, page_height = self.pages_size[idx - 1]
+                lines = self._group_into_lines(self.pages_words[idx - 1])
+                match_line = next(
+                    (line for line in lines
+                     if re.search(pattern, " ".join(w["text"] for w in line))),
+                    None
+                )
+                x0 = min((w["x0"] for w in match_line), default=None) if match_line else None
+                x1 = max((w["x1"] for w in match_line), default=None) if match_line else None
+                top = min((w["top"] for w in match_line), default=None) if match_line else None
+                info[idx] = {
+                    "num": num, "total": total, "raw": match.group(0),
+                    "x0": x0, "x1": x1, "top": top,
+                    "page_width": page_width, "page_height": page_height,
+                }
+
+        self._page_number_info = info
+        return info
+
     def check_page_numbers(self):
-        pattern = self.config["page_number_pattern"]
-        found = {}
+        mode = self.config.get("page_number_mode", "labeled")
         total_pages = len(self.pages_text)
+        info = self._detect_page_numbers()
+        unnumbered = self._resolve_unnumbered_pages(total_pages)
 
-        for idx, text in enumerate(self.pages_text, start=1):
-            match = re.search(pattern, text)
-            if not match:
-                self.report.add(
-                    "1. Page Number Verification", "FAIL",
-                    "No page number found matching expected pattern "
-                    f"'{pattern}'", page=idx
-                )
+        # Missing: any page with no detected number, unless exempted
+        for idx in range(1, total_pages + 1):
+            if idx in info or idx in unnumbered:
                 continue
-            num, total = int(match.group(1)), int(match.group(2))
-            found[idx] = (num, total, match.group(0))
+            reason = (
+                f"matching expected pattern '{self.config['page_number_pattern']}'"
+                if mode == "labeled" else "in the footer area"
+            )
+            self.report.add(
+                "1. Page Number Verification", "FAIL",
+                f"No page number found {reason}", page=idx
+            )
 
-            if total != total_pages:
-                self.report.add(
-                    "1. Page Number Verification", "FAIL",
-                    f"Declared total pages ({total}) does not match "
-                    f"actual document length ({total_pages})", page=idx
-                )
+        # Declared-total check only applies to "Page X of Y" style docs
+        if mode == "labeled":
+            for idx, d in info.items():
+                if d["total"] != total_pages:
+                    self.report.add(
+                        "1. Page Number Verification", "FAIL",
+                        f"Declared total pages ({d['total']}) does not "
+                        f"match actual document length ({total_pages})",
+                        page=idx
+                    )
 
-        declared_nums = [v[0] for v in found.values()]
+        # Duplicates
         seen = {}
-        for idx, (num, total, raw) in found.items():
-            seen.setdefault(num, []).append(idx)
-
+        for idx, d in info.items():
+            seen.setdefault(d["num"], []).append(idx)
         for num, idxs in seen.items():
             if len(idxs) > 1:
                 self.report.add(
@@ -268,7 +357,10 @@ class IFUQualityChecker:
                     f"pages {idxs}"
                 )
 
-        expected_seq = list(range(1, total_pages + 1))
+        # Missing numbers within the expected sequence (excluding
+        # exempted cover/back-cover style pages)
+        expected_seq = [i for i in range(1, total_pages + 1) if i not in unnumbered]
+        declared_nums = [d["num"] for d in info.values()]
         missing = sorted(set(expected_seq) - set(declared_nums))
         if missing:
             self.report.add(
@@ -276,7 +368,8 @@ class IFUQualityChecker:
                 f"Missing page number(s): {missing}"
             )
 
-        physical_order = [found[i][0] for i in sorted(found)]
+        # Sequence order
+        physical_order = [info[i]["num"] for i in sorted(info)]
         if physical_order != sorted(physical_order):
             self.report.add(
                 "1. Page Number Verification", "FAIL",
@@ -284,33 +377,35 @@ class IFUQualityChecker:
                 f"physical page order: {physical_order}"
             )
 
-        self._page_number_matches = found  # {idx: (num, total, raw_text)}
+        # Bare-number documents: printed number should equal the page's
+        # actual physical position in the file.
+        if mode == "bare_number":
+            for idx, d in info.items():
+                if d["num"] != idx:
+                    self.report.add(
+                        "1. Page Number Verification", "FAIL",
+                        f"Printed page number '{d['num']}' does not match "
+                        f"its physical position in the document (page {idx})",
+                        page=idx
+                    )
 
     def check_page_number_format_consistency(self):
         """
         Verifies every page uses the exact same page-number formatting
-        (capitalization, spacing, punctuation) — not just that each one
-        loosely matches the regex pattern. E.g. "Page 1 of 4" vs
-        "page 1 of 4" vs "Page 1  of 4" (double space) are all flagged
-        as inconsistent even though all three match a lenient pattern.
+        (capitalization, spacing, punctuation, leading zeros) — not just
+        that each one loosely matches the pattern.
         """
-        found = getattr(self, "_page_number_matches", {})
-        if len(found) < 2:
-            return  # nothing to compare
+        info = self._detect_page_numbers()
+        if len(info) < 2:
+            return
 
-        def template_of(raw_text, num, total):
-            # Replace the specific digits with placeholders so we compare
-            # the surrounding text/format, not the numbers themselves.
-            t = raw_text.replace(str(num), "{N}", 1)
-            t = t.replace(str(total), "{T}", 1)
+        def template_of(d):
+            t = d["raw"].replace(str(d["num"]), "{N}", 1)
+            if "total" in d:
+                t = t.replace(str(d["total"]), "{T}", 1)
             return t
 
-        templates = {
-            idx: template_of(raw, num, total)
-            for idx, (num, total, raw) in found.items()
-        }
-
-        # Majority template = the "expected" consistent format
+        templates = {idx: template_of(d) for idx, d in info.items()}
         counts = {}
         for t in templates.values():
             counts[t] = counts.get(t, 0) + 1
@@ -318,7 +413,7 @@ class IFUQualityChecker:
 
         for idx, t in templates.items():
             if t != majority_template:
-                raw = found[idx][2]
+                raw = info[idx]["raw"]
                 self.report.add(
                     "1. Page Number Verification", "FAIL",
                     f"Inconsistent page number format: '{raw}' does not "
@@ -337,29 +432,11 @@ class IFUQualityChecker:
         if not self.config.get("enforce_left_right_placement", False):
             return
 
-        pattern = self.config["page_number_pattern"]
         footer_zone_ratio = self.config.get("footer_zone_ratio", 0.85)
+        info = self._detect_page_numbers()
 
-        for idx, text in enumerate(self.pages_text, start=1):
-            match = re.search(pattern, text)
-            if not match:
-                continue  # already flagged as FAIL in check_page_numbers
-
-            declared_num = int(match.group(1))
-            words = self.pages_words[idx - 1]
-            page_width, page_height = self.pages_size[idx - 1]
-
-            # Find the visual line whose joined text matches the page
-            # number pattern, so we can get its bounding box on the page.
-            lines = self._group_into_lines(words)
-            match_line = None
-            for line in lines:
-                line_text = " ".join(w["text"] for w in line)
-                if re.search(pattern, line_text):
-                    match_line = line
-                    break
-
-            if not match_line:
+        for idx, d in info.items():
+            if d["x0"] is None:
                 self.report.add(
                     "1. Page Number Verification", "WARN",
                     "Could not determine on-page position of the page "
@@ -367,20 +444,17 @@ class IFUQualityChecker:
                 )
                 continue
 
-            x0 = min(w["x0"] for w in match_line)
-            x1 = max(w["x1"] for w in match_line)
-            top = min(w["top"] for w in match_line)
-            center_x = (x0 + x1) / 2
+            declared_num = d["num"]
+            page_width, page_height = d["page_width"], d["page_height"]
+            center_x = (d["x0"] + d["x1"]) / 2
 
-            # Vertical check: page number should sit in the footer zone
-            if top < page_height * footer_zone_ratio:
+            if d["top"] < page_height * footer_zone_ratio:
                 self.report.add(
                     "1. Page Number Verification", "FAIL",
                     "Page number is not positioned in the footer/below "
                     "area of the page", page=idx
                 )
 
-            # Horizontal check: odd -> right half, even -> left half
             is_right_half = center_x > (page_width / 2)
             expects_right = (declared_num % 2 == 1)
 
