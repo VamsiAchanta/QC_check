@@ -55,3 +55,7 @@ ifu-qc-checker/
 ## CI usage
 
 `run.py` exits non-zero if any processed PDF fails its checks, so it can be wired directly into a CI pipeline as a QC gate.
+
+## Implementation details
+
+For a deep dive into how each check actually works internally (detection algorithms, exact rules, the report data model, and how the test fixtures were built), see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
