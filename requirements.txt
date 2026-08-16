@@ -1,6 +1,2 @@
 pdfplumber>=0.10.0
 reportlab>=4.0.0
-
-# Optional — only needed if you enable check_regulatory_symbols_by_image()
-# pdf2image>=1.16.0
-# opencv-python>=4.8.0

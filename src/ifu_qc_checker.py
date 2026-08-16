@@ -3,19 +3,7 @@ IFU (Instructions for Use) QC Automation — core checker logic.
 
 Implements the checklist:
   1. Page Number Verification
-  2. Manufacturer Information
-  3. Regulatory Symbols (label/text presence — see note below)
-  4. Date Verification
-
-LIMITATION ON SYMBOLS
-----------------------
-Regulatory symbols (CE mark, biohazard, "keep dry", temperature
-limit icon, etc.) are graphical elements, not text. This checker
-detects whether the *text label/caption* near a symbol appears in
-the extracted PDF text. True shape-based symbol verification is
-provided as an optional stub (check_regulatory_symbols_by_image)
-that renders pages to images and does template matching — wire it
-up with your own symbol reference images if you need it.
+  2. Text Encoding / Garbled Text Verification
 """
 
 import re
@@ -33,6 +21,29 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 )
 from reportlab.lib import colors
+
+
+# ============================================================
+# Garbled-text detection patterns (font/encoding failures)
+# ============================================================
+
+# Characters that are unambiguous evidence of a broken font/encoding
+# mapping — they should never legitimately appear in IFU body text:
+#   - U+FFFD          the Unicode "replacement character" (undecodable byte)
+#   - U+E000-U+F8FF    Private Use Area (icon/symbol fonts misread as text)
+#   - U+2500-U+259F    box-drawing characters
+#   - U+25A0-U+25FF    geometric shapes (often glyph-substitution artifacts)
+#   - C0 control chars other than tab/newline/carriage-return
+_GARBLED_CHAR_RE = re.compile(
+    "[\uFFFD\u2500-\u25FF\uE000-\uF8FF"
+    "\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
+
+# Runs of the same ASCII "junk" symbol (3+ in a row) — a common visual
+# signature of font-substitution garbage (e.g. "???", "<<<", "###").
+# Kept separate from _GARBLED_CHAR_RE (WARN, not FAIL) because a single
+# stray "<" or ">" is often legitimate (e.g. "<50°C").
+_REPEATED_SYMBOL_RE = re.compile(r"([?<>#$%^*~`|\\@])\1{2,}")
 
 
 # ============================================================
@@ -474,185 +485,59 @@ class IFUQualityChecker:
                 )
 
     # ------------------------------------------------------
-    # 2. Manufacturer Information
+    # 2. Text Encoding / Garbled Text Verification
     # ------------------------------------------------------
-    def check_manufacturer_info(self):
-        cfg = self.config
-        total_pages = len(self.pages_text)
-        full_text = "\n".join(self.pages_text)
-
-        # Where manufacturer info is required to appear.
-        # "last" -> last physical page. A positive int -> that 1-indexed
-        # page. None -> anywhere in the document (old behavior).
-        location = cfg.get("manufacturer_info_page", "last")
-        if location == "last":
-            target_idx = total_pages
-        elif isinstance(location, int) and 1 <= location <= total_pages:
-            target_idx = location
-        else:
-            target_idx = None  # search whole document
-
-        target_text = self.pages_text[target_idx - 1] if target_idx else full_text
-        page_label = target_idx if target_idx else None
-        location_desc = f"page {target_idx}" if target_idx else "the document"
-
-        def normalize(t):
-            return re.sub(r"\s+", " ", t).strip().lower()
-
-        def fuzzy_present(value, text):
-            if not value:
-                return True
-            return normalize(value) in normalize(text)
-
-        checks = [
-            ("manufacturer_name", "Manufacturer name"),
-            ("manufacturer_address", "Manufacturer address"),
-            ("ec_rep_address", "Authorized Representative (EC REP) address"),
-            ("importer_address", "Importer/Distributor address"),
-        ]
-
-        for key, label in checks:
-            value = cfg.get(key)
-            if value is None:
-                continue
-            if fuzzy_present(value, target_text):
-                continue  # found where expected — pass
-
-            # Not found on the required page/location. Check whether it
-            # exists elsewhere in the document, to give a more precise
-            # failure message (missing entirely vs. misplaced).
-            if target_idx and fuzzy_present(value, full_text):
-                self.report.add(
-                    "2. Manufacturer Information", "FAIL",
-                    f"{label} was found elsewhere in the document but not "
-                    f"on {location_desc} as required",
-                    page=page_label
-                )
-            else:
-                self.report.add(
-                    "2. Manufacturer Information", "FAIL",
-                    f"{label} does not match approved master / not found "
-                    f"on {location_desc}",
-                    page=page_label
-                )
-
-        # Contact info consistency is checked across the whole document,
-        # since the same email/phone may legitimately appear on multiple
-        # pages (cover page + back page) and consistency is what matters.
-        emails = set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", full_text))
-        phones = set(re.findall(r"\+?\d[\d\s\-()]{7,}\d", full_text))
-        if len(emails) > 1:
-            self.report.add(
-                "2. Manufacturer Information", "WARN",
-                f"Multiple distinct email addresses found, verify consistency: {sorted(emails)}"
-            )
-        if len(phones) > 1:
-            self.report.add(
-                "2. Manufacturer Information", "WARN",
-                f"Multiple distinct phone numbers found, verify consistency: {sorted(phones)}"
-            )
-
-    # ------------------------------------------------------
-    # 3. Regulatory Symbols (text-label proxy check)
-    # ------------------------------------------------------
-    def check_regulatory_symbols(self):
-        full_text = "\n".join(self.pages_text)
-        normalized = re.sub(r"\s+", " ", full_text).lower()
-
-        for label in self.config["required_symbol_labels"]:
-            if label.lower() not in normalized:
-                self.report.add(
-                    "3. Regulatory Symbols", "WARN",
-                    f"Label/caption for symbol '{label}' not found in "
-                    "extracted text — verify the symbol graphic is present "
-                    "manually or via image-based check"
-                )
-
-    def check_regulatory_symbols_by_image(self, symbol_templates=None):
+    def check_text_encoding(self):
         """
-        OPTIONAL / STUB: True graphical symbol verification via template
-        matching. Requires: pip install pdf2image opencv-python
-        (and poppler installed on the system for pdf2image).
-
-        symbol_templates: dict of {symbol_name: path_to_template_png}
+        Flags extracted text that indicates a font/encoding problem rather
+        than real content — e.g. a font substitution where the PDF's
+        internal character codes no longer map to the glyphs actually
+        shown (common after changing/embedding fonts incorrectly), which
+        pdfplumber surfaces as the Unicode replacement character, stray
+        control bytes, or Private-Use-Area/box-drawing glyphs.
         """
-        try:
-            from pdf2image import convert_from_path
-            import cv2
-            import numpy as np
-        except ImportError:
-            self.report.add(
-                "3. Regulatory Symbols", "WARN",
-                "Image-based symbol check skipped — install pdf2image and "
-                "opencv-python to enable it"
-            )
-            return
+        symbol_warn_threshold = self.config.get("garbled_symbol_warn_threshold", 5)
 
-        if not symbol_templates:
-            return
+        for idx, text in enumerate(self.pages_text, start=1):
+            if not text:
+                continue
 
-        images = convert_from_path(self.pdf_path)
-        for page_idx, pil_img in enumerate(images, start=1):
-            page_cv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            for symbol_name, template_path in symbol_templates.items():
-                template = cv2.imread(template_path)
-                if template is None:
-                    continue
-                result = cv2.matchTemplate(page_cv, template, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, _ = cv2.minMaxLoc(result)
-                if max_val < 0.7:
-                    self.report.add(
-                        "3. Regulatory Symbols", "WARN",
-                        f"Symbol '{symbol_name}' not confidently detected "
-                        f"(match={max_val:.2f})", page=page_idx
-                    )
-
-    # ------------------------------------------------------
-    # 4. Date Verification
-    # ------------------------------------------------------
-    def check_dates(self):
-        full_text = "\n".join(self.pages_text)
-        normalized = re.sub(r"\s+", " ", full_text)
-
-        for label in self.config["required_date_labels"]:
-            if label.lower() not in normalized.lower():
+            garbled_chars = _GARBLED_CHAR_RE.findall(text)
+            if garbled_chars:
+                uniq = sorted(set(garbled_chars))
                 self.report.add(
-                    "4. Date Verification", "FAIL",
-                    f"Required date field '{label}' not found in document"
+                    "2. Text Encoding / Garbled Text", "FAIL",
+                    "Unreadable/undefined character(s) found in extracted "
+                    "text — likely a font/encoding issue (e.g. a font was "
+                    "swapped and its character codes no longer map to the "
+                    f"correct glyphs): {', '.join(repr(c) for c in uniq)}",
+                    page=idx
                 )
 
-        date_regex = self.config["date_display_regex"]
-        all_dates = re.findall(date_regex, normalized)
-        if not all_dates:
-            self.report.add(
-                "4. Date Verification", "WARN",
-                f"No dates matching expected format found (pattern: {date_regex})"
-            )
-        else:
-            for d in all_dates:
-                if not self._is_valid_date(d):
-                    self.report.add(
-                        "4. Date Verification", "FAIL",
-                        f"Date '{d}' matches format pattern but is not a "
-                        "valid calendar date"
-                    )
+            repeated = _REPEATED_SYMBOL_RE.findall(text)
+            if repeated:
+                self.report.add(
+                    "2. Text Encoding / Garbled Text", "WARN",
+                    "Repeated symbol run(s) found (3+ in a row) for "
+                    f"character(s) {', '.join(sorted(set(repeated)))} — "
+                    "may indicate garbled text from a font substitution issue",
+                    page=idx
+                )
 
-    @staticmethod
-    def _is_valid_date(date_str):
-        for fmt in ("%d %b %Y", "%d %B %Y"):
-            try:
-                datetime.strptime(date_str, fmt)
-                return True
-            except ValueError:
-                continue
-        return False
+            symbol_hits = sum(text.count(ch) for ch in "?<>")
+            if symbol_hits >= symbol_warn_threshold:
+                self.report.add(
+                    "2. Text Encoding / Garbled Text", "WARN",
+                    f"Unusually high count of '?' / '<' / '>' characters "
+                    f"({symbol_hits}) — verify this page isn't rendering "
+                    "garbled text due to a font/encoding problem",
+                    page=idx
+                )
 
     # ------------------------------------------------------
     def run_all(self):
         self.check_page_numbers()
         self.check_page_number_format_consistency()
         self.check_page_placement()
-        self.check_manufacturer_info()
-        self.check_regulatory_symbols()
-        self.check_dates()
+        self.check_text_encoding()
         return self.report
