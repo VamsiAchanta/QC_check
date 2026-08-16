@@ -5,6 +5,8 @@ Implements the checklist:
   1. Page Number Verification
   2. Text Encoding / Garbled Text Verification
   3. Manufacturer Symbol Verification
+  4. CE Marking Verification
+  5. Prescription (Rx Only) Notice Verification
 """
 
 import re
@@ -536,6 +538,51 @@ class IFUQualityChecker:
                 )
 
     # ------------------------------------------------------
+    # Shared helpers for image-based (rendered-page) checks
+    # ------------------------------------------------------
+    def _resolve_target_page_index(self, location):
+        total_pages = len(self.pages_text)
+        if location == "last":
+            return total_pages
+        if location == "first":
+            return 1
+        if isinstance(location, int) and 1 <= location <= total_pages:
+            return location
+        return total_pages
+
+    def _render_page_grayscale(self, pymupdf, cv2, np, target_idx, dpi):
+        """Renders one 1-indexed page to a grayscale numpy array."""
+        doc = pymupdf.open(self.pdf_path)
+        page = doc[target_idx - 1]
+        zoom = dpi / 72
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        page_gray = img[:, :, 0] if pix.n == 1 else cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
+        doc.close()
+        return page_gray
+
+    @staticmethod
+    def _best_template_match_score(cv2, page_gray, template, width_ratios):
+        """
+        Tries `template` at several sizes (as a fraction of page width,
+        since the symbol's on-page size isn't known ahead of time) and
+        returns the best normalized cross-correlation score found.
+        """
+        best_score = -1.0
+        page_h, page_w = page_gray.shape
+        template_h, template_w = template.shape
+        for width_ratio in width_ratios:
+            resized_w = max(10, int(page_w * width_ratio))
+            resized_h = max(10, int(template_h * (resized_w / template_w)))
+            if resized_h >= page_h or resized_w >= page_w:
+                continue
+            resized = cv2.resize(template, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+            result = cv2.matchTemplate(page_gray, resized, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            best_score = max(best_score, max_val)
+        return best_score
+
+    # ------------------------------------------------------
     # 3. Manufacturer Symbol Verification
     # ------------------------------------------------------
     def check_manufacturer_symbol(self):
@@ -563,16 +610,9 @@ class IFUQualityChecker:
             )
             return
 
-        total_pages = len(self.pages_text)
-        location = self.config.get("manufacturer_symbol_page", "last")
-        if location == "last":
-            target_idx = total_pages
-        elif location == "first":
-            target_idx = 1
-        elif isinstance(location, int) and 1 <= location <= total_pages:
-            target_idx = location
-        else:
-            target_idx = total_pages
+        target_idx = self._resolve_target_page_index(
+            self.config.get("manufacturer_symbol_page", "last")
+        )
 
         template_path = self.config.get("manufacturer_symbol_template") or (
             Path(__file__).resolve().parent.parent
@@ -590,32 +630,14 @@ class IFUQualityChecker:
         dpi = self.config.get("manufacturer_symbol_render_dpi", 150)
         threshold = self.config.get("manufacturer_symbol_match_threshold", 0.6)
 
-        doc = pymupdf.open(self.pdf_path)
-        page = doc[target_idx - 1]
-        zoom = dpi / 72
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        page_gray = img[:, :, 0] if pix.n == 1 else cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
-        doc.close()
-
-        # The symbol's on-page size relative to the page is unknown, so
-        # try the template at several plausible sizes (as a fraction of
-        # page width) and keep the best match across all of them. Ratios
-        # below ~0.06 are excluded: at that size the resized template is
-        # only a few dozen pixels wide, and matching against mostly-blank
-        # page background spuriously scores high regardless of content.
-        best_score = -1.0
-        page_h, page_w = page_gray.shape
-        template_h, template_w = template.shape
-        for width_ratio in (0.07, 0.09, 0.12, 0.16, 0.20, 0.25):
-            resized_w = max(10, int(page_w * width_ratio))
-            resized_h = max(10, int(template_h * (resized_w / template_w)))
-            if resized_h >= page_h or resized_w >= page_w:
-                continue
-            resized = cv2.resize(template, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
-            result = cv2.matchTemplate(page_gray, resized, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
-            best_score = max(best_score, max_val)
+        # Ratios below ~0.06 are excluded: at that size the resized
+        # template is only a few dozen pixels wide, and matching against
+        # mostly-blank page background spuriously scores high regardless
+        # of content (found empirically — see docs/IMPLEMENTATION.md).
+        page_gray = self._render_page_grayscale(pymupdf, cv2, np, target_idx, dpi)
+        best_score = self._best_template_match_score(
+            cv2, page_gray, template, (0.07, 0.09, 0.12, 0.16, 0.20, 0.25)
+        )
 
         if best_score < threshold:
             self.report.add(
@@ -627,10 +649,110 @@ class IFUQualityChecker:
             )
 
     # ------------------------------------------------------
+    # 4. CE Marking Verification
+    # ------------------------------------------------------
+    def check_ce_marking(self):
+        """
+        Confirms the CE conformity marking is present on the required
+        page (last page by default) via image template matching. Two
+        reference variants are accepted (either is sufficient): the bare
+        "CE" mark, and "CE" followed by a notified body number (e.g.
+        "CE0344") for device classes that require notified-body
+        involvement. Like the manufacturer symbol, this is a standardized
+        graphic, not reliably present as extractable text.
+        """
+        if not self.config.get("require_ce_marking", False):
+            return
+
+        try:
+            import pymupdf
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.report.add(
+                "4. CE Marking", "WARN",
+                "CE-marking check skipped — install pymupdf, opencv-python "
+                "and numpy (see requirements.txt) to enable image-based "
+                "symbol detection"
+            )
+            return
+
+        target_idx = self._resolve_target_page_index(
+            self.config.get("ce_marking_page", "last")
+        )
+
+        default_assets = Path(__file__).resolve().parent.parent / "assets"
+        template_paths = self.config.get("ce_marking_templates") or [
+            default_assets / "ce_mark_template.png",
+            default_assets / "ce_mark_0344_template.png",
+        ]
+        templates = []
+        for p in template_paths:
+            t = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if t is not None:
+                templates.append(t)
+        if not templates:
+            self.report.add(
+                "4. CE Marking", "WARN",
+                "CE-marking check skipped — no reference template images "
+                f"found among: {[str(p) for p in template_paths]}"
+            )
+            return
+
+        dpi = self.config.get("ce_marking_render_dpi", 150)
+        threshold = self.config.get("ce_marking_match_threshold", 0.6)
+
+        page_gray = self._render_page_grayscale(pymupdf, cv2, np, target_idx, dpi)
+        best_score = max(
+            self._best_template_match_score(
+                cv2, page_gray, template, (0.05, 0.07, 0.09, 0.12, 0.15, 0.20)
+            )
+            for template in templates
+        )
+
+        if best_score < threshold:
+            self.report.add(
+                "4. CE Marking", "FAIL",
+                "Required CE conformity marking (CE or CE + notified body "
+                f"number) not found on page {target_idx} "
+                f"(best match confidence {best_score:.2f}, need >= {threshold})",
+                page=target_idx
+            )
+
+    # ------------------------------------------------------
+    # 5. Prescription (Rx Only) Notice Verification
+    # ------------------------------------------------------
+    def check_rx_only_notice(self):
+        """
+        Confirms the prescription-use notice (e.g. "Rx Only") appears as
+        text on the required page (last page by default). Unlike the
+        manufacturer symbol and CE mark, this notice is ordinary text,
+        so it's checked via extracted text rather than image matching.
+        """
+        if not self.config.get("require_rx_only_text", False):
+            return
+
+        target_idx = self._resolve_target_page_index(
+            self.config.get("rx_only_page", "last")
+        )
+        expected = self.config.get("rx_only_text", "Rx Only")
+        target_text = re.sub(r"\s+", " ", self.pages_text[target_idx - 1]).strip().lower()
+
+        if expected.lower() not in target_text:
+            self.report.add(
+                "5. Prescription (Rx Only) Notice", "FAIL",
+                f"Required prescription notice '{expected}' not found on "
+                f"page {target_idx}",
+                page=target_idx
+            )
+
+    # ------------------------------------------------------
     def run_all(self):
         self.check_page_numbers()
         self.check_page_number_format_consistency()
         self.check_page_placement()
         self.check_text_encoding()
         self.check_manufacturer_symbol()
+        self.check_ce_marking()
+        self.check_rx_only_notice()
         return self.report

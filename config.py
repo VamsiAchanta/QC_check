@@ -52,4 +52,24 @@ CONFIG = {
     # match. The template is tried at several sizes since the symbol's
     # on-page size relative to the page isn't known in advance.
     "manufacturer_symbol_match_threshold": 0.6,
+
+    # ---- 4. CE Marking Verification ----
+    # Requires the same pip extras as the manufacturer symbol check.
+    "require_ce_marking": True,
+    "ce_marking_page": "last",
+    # List of reference images — the page passes if it matches ANY one
+    # of them (either variant is acceptable). None -> use the bundled
+    # assets/ce_mark_template.png (bare "CE") and
+    # assets/ce_mark_0344_template.png ("CE" + notified body no. 0344).
+    "ce_marking_templates": None,
+    "ce_marking_render_dpi": 150,
+    "ce_marking_match_threshold": 0.6,
+
+    # ---- 5. Prescription (Rx Only) Notice Verification ----
+    "require_rx_only_text": True,
+    # Which page must carry the notice: "last" (default), "first", or a
+    # specific 1-indexed page int.
+    "rx_only_page": "last",
+    # Exact notice text expected (case-insensitive substring match).
+    "rx_only_text": "Rx Only",
 }

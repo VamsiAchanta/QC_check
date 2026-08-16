@@ -5,6 +5,8 @@ Automates QC checks on IFU (Instructions for Use) PDF documents:
 1. **Page Number Verification** — sequence, missing/duplicate numbers, consistent format, and **odd/even footer placement** (odd pages on the right, even pages on the left, positioned in the footer area). Supports two numbering styles: `"Page X of Y"` text, or a bare standalone number (configurable, see below). Cover/back-cover pages can be exempted from requiring a printed number.
 2. **Text Encoding / Garbled Text Verification** — flags pages where a font/encoding problem (e.g. a swapped font whose character codes no longer map to the correct glyphs) has produced unreadable text: the Unicode replacement character, stray control bytes, Private-Use-Area/box-drawing glyphs (FAIL), or an unusually high count of `?` / `<` / `>` characters or repeated symbol runs like `???`/`<<<` (WARN)
 3. **Manufacturer Symbol Verification** — confirms the ISO 7000-3082 "Manufacturer" factory pictogram is present on the required page (last page by default) using real image template matching, since the symbol is graphics, not text. Skips itself with a WARN if the optional image-processing dependencies aren't installed.
+4. **CE Marking Verification** — confirms the CE conformity marking is present on the required page (last page by default), also via image template matching. Either the bare "CE" mark or "CE" + a notified body number (e.g. "CE0344") is accepted.
+5. **Prescription (Rx Only) Notice Verification** — confirms the prescription-use notice text (e.g. "Rx Only") is present on the required page.
 
 ## Setup
 
@@ -43,6 +45,10 @@ Edit `config.py` — this is the only file you should need to touch to adapt the
 - **`manufacturer_symbol_page`** — which page must carry the symbol: `"last"` (default), `"first"`, or a specific 1-indexed page int
 - **`manufacturer_symbol_template`** — path to the reference symbol image; `None` (default) uses the bundled `assets/manufacturer_symbol_template.png`
 - **`manufacturer_symbol_render_dpi`** / **`manufacturer_symbol_match_threshold`** — rendering resolution and minimum match confidence (0-1) for the template match (defaults `150` / `0.6`)
+- **`require_ce_marking`** / **`ce_marking_page`** — turn the CE-marking check on/off (default `True`) and which page it must appear on (default `"last"`)
+- **`ce_marking_templates`** — list of reference images to accept (any one match passes); `None` (default) uses the bundled bare-"CE" and "CE0344" templates
+- **`ce_marking_render_dpi`** / **`ce_marking_match_threshold`** — same idea as the manufacturer symbol's (defaults `150` / `0.6`)
+- **`require_rx_only_text`** / **`rx_only_page`** / **`rx_only_text`** — turn the Rx-Only check on/off (default `True`), which page it must appear on (default `"last"`), and the expected text (default `"Rx Only"`, case-insensitive)
 
 ## Project structure
 
@@ -54,7 +60,9 @@ ifu-qc-checker/
 ├── src/
 │   └── ifu_qc_checker.py  # core check logic (IFUQualityChecker class)
 ├── assets/
-│   └── manufacturer_symbol_template.png  # reference image for the symbol check
+│   ├── manufacturer_symbol_template.png  # reference image for the manufacturer symbol check
+│   ├── ce_mark_template.png              # reference image: bare "CE" mark
+│   └── ce_mark_0344_template.png         # reference image: "CE" + notified body no. 0344
 ├── input_pdfs/            # <- drop PDF files to check here
 └── output_reports/        # JSON reports land here after each run
 ```

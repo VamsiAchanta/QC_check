@@ -18,9 +18,12 @@ pages_text[]     pages_words[]     pages_size[]     (+ raw PDF bytes for renderi
       └───────┬────────┴────────┬───────┴──────────┬───────────┘
               ▼                 ▼                   ▼
    check_page_numbers() ...   check_text_encoding()   check_manufacturer_symbol()
-   check_page_number_format_consistency()             (pymupdf render + cv2 template match)
-   check_page_placement()
-              │                 │                   │
+   check_page_number_format_consistency()             check_ce_marking()
+   check_page_placement()                             (share _render_page_grayscale()
+              │                 │                      + _best_template_match_score();
+              │                 │                      pymupdf render + cv2 match)
+              │                 │                     check_rx_only_notice()
+              │                 │                      (plain text, no rendering)
               └────────┬────────┴─────────┬─────────┘
                        ▼
                   QCReport
@@ -41,6 +44,8 @@ def run_all(self):
     self.check_page_placement()
     self.check_text_encoding()
     self.check_manufacturer_symbol()
+    self.check_ce_marking()
+    self.check_rx_only_notice()
     return self.report
 ```
 
@@ -159,6 +164,8 @@ The other two checks work entirely on `pages_text`/`pages_words` — text pdfplu
 
 ### 4.2 Algorithm (`check_manufacturer_symbol`)
 
+The page-resolution and rendering machinery here is factored into three shared helpers reused by `check_ce_marking()` too (§5): `_resolve_target_page_index(location)`, `_render_page_grayscale(pymupdf, cv2, np, target_idx, dpi)`, and `_best_template_match_score(cv2, page_gray, template, width_ratios)`.
+
 Gated by `config["require_manufacturer_symbol"]`. Steps:
 
 1. Import `pymupdf`, `cv2` (OpenCV), `numpy` — all optional. If any is missing, add a **WARN** ("install pymupdf, opencv-python and numpy") and return; the check never hard-fails the run over a missing dependency.
@@ -196,7 +203,50 @@ The 0.6 threshold and the excluded small-scale range were both derived by measur
 
 The first attempt also included ratios `0.03`/`0.05`: those scored `0.588`/`0.568` on the *empty* page — high enough to falsely clear a 0.55 threshold — because at ~40px wide the template is mostly white margin, and white-on-white correlates well no matter what's underneath. Dropping those two scales and raising the threshold to 0.6 gives a clean, wide margin between the two fixtures (0.847 vs. 0.462) instead of a near-miss.
 
-## 5. Report outputs
+## 5. Check 4 — CE Marking Verification
+
+Category label in the report: `"4. CE Marking"`.
+
+### 5.1 Why two templates, and why "either is fine"
+
+The CE conformity mark has two legitimate on-page forms depending on device classification: the bare mark, or the mark followed by the notified body's 4-digit ID (e.g. `CE0344`) when the device's conformity assessment required notified-body involvement. A document with either form is compliant — flagging a document for using the "wrong" one would be a false positive — so `check_ce_marking()` accepts a match against **any** of `config["ce_marking_templates"]` (default: `assets/ce_mark_template.png` and `assets/ce_mark_0344_template.png`), taking the max score across all of them, all at the same multi-scale search used for the manufacturer symbol.
+
+Both reference images were built the same way as the manufacturer symbol's — a faithful geometric recreation (two rounded "C"/mirrored-"C"-with-bar shapes forming the CE glyph pair, per the standard mark's construction) via `PIL.ImageDraw`, not a scanned/sourced logo asset.
+
+### 5.2 Algorithm (`check_ce_marking`)
+
+Same shape as `check_manufacturer_symbol()`, reusing the shared helpers from §4.2, with two differences: multiple templates are tried (`max()` over each template's own best score), and the search uses a different scale range — `(0.05, 0.07, 0.09, 0.12, 0.15, 0.20)` × page width — since the CE mark tends to render smaller on-page than the manufacturer pictogram. `best_score < config["ce_marking_match_threshold"]` (default `0.6`) → **FAIL**. Same WARN-and-skip behavior if `pymupdf`/`cv2`/`numpy` are missing or no template image loads.
+
+### 5.3 Threshold calibration
+
+Measured against three fixtures (§7) — bare CE embedded, CE0344 embedded, and neither:
+
+| width ratio | *bare CE* fixture, `ce_only` template | *CE0344* fixture, `ce_only` template | *CE0344* fixture, `ce_0344` template | *missing* fixture, best of both |
+|---|---|---|---|---|
+| 0.05 | 0.313 | 0.313 | 0.351 | 0.351 |
+| 0.07 | 0.439 | **0.934** | 0.276 | 0.243 |
+| 0.09 | **0.696** | 0.354 | 0.585 | 0.235 |
+| 0.12 | 0.209 | 0.213 | 0.507 | 0.213 |
+
+Two things stand out: the *CE0344* fixture's strongest match is actually against the **bare-CE** template (0.934) at a smaller scale — because the CE0344 artwork visually contains the bare-CE glyph pair as its left portion, so a smaller `ce_only` template correlates against just that sub-region. That's fine: since the check takes the max across all templates and scales, this only ever makes detection *more* confident, never less. The *missing* fixture tops out at 0.351 regardless of template — a wide margin below the 0.6 threshold, so no recalibration was needed here (unlike the manufacturer symbol, which required excluding small scales — see §4.3).
+
+## 6. Check 5 — Prescription (Rx Only) Notice Verification
+
+Category label in the report: `"5. Prescription (Rx Only) Notice"`.
+
+Unlike the previous two, this notice is ordinary printed text (see the "Rx Only" line in the reference photo), so `check_rx_only_notice()` doesn't render anything — it reuses `pages_text` like Check 1 and Check 2. Gated by `config["require_rx_only_text"]`. Logic:
+
+```python
+target_idx = self._resolve_target_page_index(self.config.get("rx_only_page", "last"))
+expected = self.config.get("rx_only_text", "Rx Only")
+target_text = re.sub(r"\s+", " ", self.pages_text[target_idx - 1]).strip().lower()
+if expected.lower() not in target_text:
+    # FAIL
+```
+
+A simple case-insensitive substring match against the resolved target page (`"last"` by default) — no fuzzy matching or regex, since this is a fixed, short, standardized phrase rather than free-form prose.
+
+## 7. Report outputs
 
 `QCReport` (dataclass, `src/ifu_qc_checker.py`) holds a flat list of `Issue(category, severity, message, page)` and renders it three ways:
 
@@ -206,7 +256,7 @@ The first attempt also included ratios `0.03`/`0.05`: those scored `0.588`/`0.56
 
 `run.py` exits non-zero if *any* processed PDF has `report.passed() == False`, so it can gate a CI pipeline directly.
 
-## 6. Configuration reference (`config.py`)
+## 8. Configuration reference (`config.py`)
 
 | Key | Code default (if key omitted) | This project's `config.py` value | Used by |
 |---|---|---|---|
@@ -222,8 +272,16 @@ The first attempt also included ratios `0.03`/`0.05`: those scored `0.588`/`0.56
 | `manufacturer_symbol_template` | *(bundled asset)* | `None` → bundled asset | `check_manufacturer_symbol` reference image |
 | `manufacturer_symbol_render_dpi` | `150` | `150` | page-render resolution |
 | `manufacturer_symbol_match_threshold` | `0.6` | `0.6` | minimum match confidence |
+| `require_ce_marking` | `False` | `True` | `check_ce_marking` gate |
+| `ce_marking_page` | `"last"` | `"last"` | `check_ce_marking` target page |
+| `ce_marking_templates` | *(bundled assets)* | `None` → both bundled assets | `check_ce_marking` reference images (any match passes) |
+| `ce_marking_render_dpi` | `150` | `150` | page-render resolution |
+| `ce_marking_match_threshold` | `0.6` | `0.6` | minimum match confidence |
+| `require_rx_only_text` | `False` | `True` | `check_rx_only_notice` gate |
+| `rx_only_page` | `"last"` | `"last"` | `check_rx_only_notice` target page |
+| `rx_only_text` | `"Rx Only"` | `"Rx Only"` | expected notice text (case-insensitive) |
 
-## 7. Test fixtures
+## 9. Test fixtures
 
 All fixtures live in `input_pdfs/` and were generated by one-off scripts (not committed — `input_pdfs/*.pdf` is gitignored) to exercise real extraction/rendering behavior, not just unit-test the regex or matching logic in isolation.
 
@@ -267,7 +325,11 @@ All pages in both fixtures carry correctly-placed footer numbers, so every findi
 
 A minimal pair used to calibrate and verify Check 3 in isolation. Both have an identical page 1 (ordinary body text) and page 2 (manufacturer name/address text). The *present* variant additionally draws `assets/manufacturer_symbol_template.png` onto page 2 at 10% of page width via `reportlab`'s `drawImage`; the *missing* variant doesn't. Running `check_manufacturer_symbol()` against each: `present` → no finding (best match 0.847, ≥ 0.6 threshold); `missing` → FAIL (best match 0.462). See §4.3 for the full per-scale score table these fixtures produced, which is what the threshold and excluded-scale-range were tuned against.
 
-## 8. Extending the checker
+### `test_scenario_ce_only.pdf` / `test_scenario_ce_0344.pdf` / `test_scenario_ce_missing.pdf` (2 pages each)
+
+Three variants used to calibrate and verify Checks 4 and 5 together: page 2 of each carries manufacturer name text and, in the first two, one of the two CE reference images (`ce_only` at 8% page width, `ce_0344` at 10%) plus an "Rx Only" line; the *missing* variant has neither. `check_ce_marking()` + `check_rx_only_notice()` against each: `ce_only` → no findings; `ce_0344` → no findings; `missing` → CE-marking FAIL (best match 0.351) **and** Rx-Only FAIL. See §5.3 for the full score table.
+
+## 10. Extending the checker
 
 To add a new check:
 
