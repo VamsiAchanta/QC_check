@@ -14,6 +14,17 @@ CONFIG = {
     # Only used when page_number_mode == "bare_number": max digit length
     # a page number can be, to avoid false-matching unrelated numbers.
     "bare_number_max_digits": 4,
+    # Only used when page_number_mode == "bare_number" — how to pick the
+    # page number among candidate digits on a page:
+    #   "footer_zone"  -> must sit within the bottom footer_zone_ratio
+    #                     slice of the physical page (default; assumes a
+    #                     dedicated footer/margin area)
+    #   "last_on_page" -> no dedicated footer to anchor on; just take
+    #                     whichever digit sits lowest on the page,
+    #                     regardless of how close that is to the bottom
+    #                     edge (works when content length varies and the
+    #                     "footer" is really just wherever content ends)
+    "bare_number_position_rule": "last_on_page",
 
     # Pages allowed to have NO printed page number at all (e.g. a cover
     # page or a manufacturer/back-cover page commonly aren't numbered).

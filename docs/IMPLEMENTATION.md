@@ -61,7 +61,9 @@ This is the shared engine every page-number rule reads from. It supports two doc
 
 **`"labeled"`** (default) — pages carry text like `"Page 3 of 42"`. The full page text is matched against `config["page_number_pattern"]` (default `r"Page\s+(\d+)\s+of\s+(\d+)"`). Group 1 is the page number, group 2 is the declared total. The matching line is then located again in the word-coordinate data (`extract_words()`) so its on-page position (`x0`, `x1`, `top`) is known for the placement check.
 
-**`"bare_number"`** — pages show just a standalone digit, no `"Page"/"of"` wording (common in compact IFUs). Because there's no surrounding text to anchor on, detection works purely from word coordinates:
+**`"bare_number"`** — pages show just a standalone digit, no `"Page"/"of"` wording (common in compact IFUs). Because there's no surrounding text to anchor on, detection works purely from word coordinates, and supports two position rules via `config["bare_number_position_rule"]`:
+
+**`"footer_zone"`** (default) — the number must sit within the bottom `footer_zone_ratio` slice of the physical page (default bottom 15%, i.e. `top >= height * 0.85`); the candidate closest to a page **edge** wins, since a real page number sits near the margin, not mid-footer.
 
 ```python
 digit_re = re.compile(r"\d{1," + str(max_digits) + "}")
@@ -73,7 +75,9 @@ candidates = [
 best = min(candidates, key=lambda w: min(w["x0"], page_width - w["x1"]))
 ```
 
-Every standalone number in the bottom `footer_zone_ratio` slice of the page (default bottom 15%, i.e. `top >= height * 0.85`) is a candidate; the one closest to a page **edge** wins, since a real page number sits near the margin, not mid-footer. `bare_number_max_digits` (default 4) bounds how many digits count, to avoid matching unrelated numbers.
+**`"last_on_page"`** — for documents with no dedicated footer margin, where the number just follows wherever the body content happens to end (which varies page to page). Instead of a fixed bottom-of-page zone, whichever digit sits lowest (`max(top)`) on the page is taken as the number, with edge-proximity only used to break ties on the same line. Pages listed in `unnumbered_pages` are **skipped entirely** under this rule (not just exempted from the "missing" check) — cover/back-cover pages routinely carry their own trailing digits (addresses, dates, catalog/CE numbers), and without a footer zone to filter by, those would otherwise be misdetected as the page number. This was caught empirically: an early version searched every page and picked up a stray "0123" from CE-mark text on an exempted back-cover page, producing several false FAILs (duplicate/position-mismatch/placement) that had nothing to do with actual page numbering.
+
+`bare_number_max_digits` (default 4) bounds how many digits count under either rule, to avoid matching unrelated numbers.
 
 Both modes populate the same shape: `{idx: {"num", "raw", "total"?, "x0", "x1", "top", "page_width", "page_height"}}`, cached on `self._page_number_info` so repeated checks don't redo the work.
 
@@ -109,9 +113,9 @@ Independent of the numeric rules above — this checks *formatting*, not value. 
 
 Gated by `config["enforce_left_right_placement"]` (default `True` in this project's `config.py`, `False` if unset). For every detected page number:
 
-1. If `top < page_height * footer_zone_ratio` → FAIL, "not positioned in the footer/below area."
+1. If `bare_number_position_rule != "last_on_page"` **and** `top < page_height * footer_zone_ratio` → FAIL, "not positioned in the footer/below area." This sub-check is skipped entirely under `"last_on_page"`: detection there has already taken whatever sits lowest on the page as *the* number, so re-applying a fixed-zone requirement would just contradict the reason that rule exists (documents with no dedicated footer, where content length varies) and produce the same false FAILs the rule was built to avoid.
 2. Compute `center_x = (x0 + x1) / 2`. `is_right_half = center_x > page_width / 2`.
-3. `expects_right = (declared_num % 2 == 1)` — **odd pages must be right-aligned in the footer, even pages left-aligned.**
+3. `expects_right = (declared_num % 2 == 1)` — **odd pages must be right-aligned in the footer, even pages left-aligned.** This side rule still applies under both position rules.
 4. Mismatch → FAIL with the specific side that was expected vs. found.
 
 Note this uses the *declared* page number, not the physical page index — so a misprinted number (like the duplicate "5" on physical page 7 above) is judged by what's printed, not where it physically sits, which is why that fixture's page 7 didn't also fail placement: it printed "5" (odd) and was correctly right-aligned.
@@ -263,6 +267,7 @@ A simple case-insensitive substring match against the resolved target page (`"la
 | `page_number_mode` | `"labeled"` | `"bare_number"` | `_detect_page_numbers` |
 | `page_number_pattern` | *(required in labeled mode)* | `r"Page\s+(\d+)\s+of\s+(\d+)"` | `_detect_page_numbers` (labeled mode only) |
 | `bare_number_max_digits` | `4` | `4` | `_detect_page_numbers` (bare mode only) |
+| `bare_number_position_rule` | `"footer_zone"` | `"last_on_page"` | `_detect_page_numbers` + `check_page_placement` (bare mode only) |
 | `unnumbered_pages` | `[]` | `["first", "last"]` | `_resolve_unnumbered_pages` |
 | `enforce_left_right_placement` | `False` | `True` | `check_page_placement` gate |
 | `footer_zone_ratio` | `0.85` | `0.85` | bare-number detection + placement footer check |
@@ -299,6 +304,29 @@ Built with `reportlab.pdfgen.canvas`. Planted defects, one per rule:
 | 6 | no footer number at all | missing-number FAIL |
 | 7 | "5" printed again (should be "7") | duplicate FAIL + bare-number position-mismatch FAIL + missing-"7" FAIL |
 | 8 | back cover, no number | exempted via `unnumbered_pages: [..., "last"]` |
+
+### `test_scenario_no_footer.pdf` (4 pages)
+
+Built to exercise `bare_number_position_rule: "last_on_page"` specifically — a layout with no dedicated footer margin, where the number just follows wherever content ends:
+
+| Page | Layout | Purpose |
+|---|---|---|
+| 1 | Cover, no number | exempted via `unnumbered_pages: ["first", ...]` |
+| 2 | Two lines of body text, number placed right after (~24% down the page, nowhere near the bottom edge) | proves detection isn't tied to a fixed bottom-of-page zone |
+| 3 | 45 lines filling the page, number near the bottom, right-aligned | shows the "page is full" case is handled the same way |
+| 4 | Back cover with a "Catalog No. 9081" line and no page number | proves the exempted page is skipped entirely rather than misreading "9081" as a page number |
+
+Run against both rules for comparison — `check_page_numbers()` + `check_page_placement()` only, isolated from the other checks:
+
+```
+--- last_on_page (new) ---
+  (no page-number findings)
+--- footer_zone (old) ---
+  FAIL: No page number found in the footer area
+  FAIL: Missing page number(s): [2]
+```
+
+Page 2's number sits at roughly `top / page_height ≈ 0.24` — well short of the `footer_zone_ratio` default of `0.85` — so the old rule genuinely can't see it; the new rule finds it correctly since it only cares about relative vertical position on the page, not proximity to the physical edge.
 
 ### `test_scenario_undefined_text.pdf` (4 pages)
 

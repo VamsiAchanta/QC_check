@@ -280,17 +280,42 @@ class IFUQualityChecker:
         if mode == "bare_number":
             max_digits = self.config.get("bare_number_max_digits", 4)
             footer_zone_ratio = self.config.get("footer_zone_ratio", 0.85)
+            position_rule = self.config.get("bare_number_position_rule", "footer_zone")
             digit_re = re.compile(r"\d{1," + str(max_digits) + "}")
+            unnumbered = (
+                self._resolve_unnumbered_pages(len(self.pages_text))
+                if position_rule == "last_on_page" else set()
+            )
 
             for idx, words in enumerate(self.pages_words, start=1):
                 page_width, page_height = self.pages_size[idx - 1]
-                candidates = [
-                    w for w in words
-                    if digit_re.fullmatch(w["text"])
-                    and w["top"] >= page_height * footer_zone_ratio
-                ]
-                if not candidates:
-                    continue
+                digit_words = [w for w in words if digit_re.fullmatch(w["text"])]
+
+                if position_rule == "last_on_page":
+                    # No dedicated footer to anchor on — treat whichever
+                    # digit sits lowest on the page (max "top") as the
+                    # page number, regardless of how close that is to the
+                    # physical bottom edge. Ties (same line) fall back to
+                    # edge-proximity, since a real page number still sits
+                    # near a margin rather than mid-line.
+                    #
+                    # Pages exempted from needing a number (cover/back
+                    # cover) are skipped entirely rather than searched:
+                    # those pages often carry trailing digits of their own
+                    # (addresses, dates, catalog/CE numbers) that would
+                    # otherwise get misdetected as a bogus "page number".
+                    if idx in unnumbered or not digit_words:
+                        continue
+                    max_top = max(w["top"] for w in digit_words)
+                    candidates = [w for w in digit_words if w["top"] == max_top]
+                else:
+                    candidates = [
+                        w for w in digit_words
+                        if w["top"] >= page_height * footer_zone_ratio
+                    ]
+                    if not candidates:
+                        continue
+
                 # Prefer the candidate closest to a page edge (left or
                 # right margin) — real page numbers sit near the edge,
                 # not in the middle of the footer.
@@ -447,6 +472,13 @@ class IFUQualityChecker:
             return
 
         footer_zone_ratio = self.config.get("footer_zone_ratio", 0.85)
+        # When detection has no dedicated footer to anchor on (see
+        # bare_number_position_rule in _detect_page_numbers), the number
+        # is by construction whatever sits lowest on the page — a
+        # separate "is it close enough to the bottom edge" check would
+        # just contradict that and produce false FAILs on pages with
+        # sparse content. Only the left/right side rule still applies.
+        check_footer_zone = self.config.get("bare_number_position_rule", "footer_zone") != "last_on_page"
         info = self._detect_page_numbers()
 
         for idx, d in info.items():
@@ -462,7 +494,7 @@ class IFUQualityChecker:
             page_width, page_height = d["page_width"], d["page_height"]
             center_x = (d["x0"] + d["x1"]) / 2
 
-            if d["top"] < page_height * footer_zone_ratio:
+            if check_footer_zone and d["top"] < page_height * footer_zone_ratio:
                 self.report.add(
                     "1. Page Number Verification", "FAIL",
                     "Page number is not positioned in the footer/below "

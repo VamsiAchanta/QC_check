@@ -2,7 +2,7 @@
 
 Automates QC checks on IFU (Instructions for Use) PDF documents:
 
-1. **Page Number Verification** — sequence, missing/duplicate numbers, consistent format, and **odd/even footer placement** (odd pages on the right, even pages on the left, positioned in the footer area). Supports two numbering styles: `"Page X of Y"` text, or a bare standalone number (configurable, see below). Cover/back-cover pages can be exempted from requiring a printed number.
+1. **Page Number Verification** — sequence, missing/duplicate numbers, consistent format, and **odd/even footer placement** (odd pages on the right, even pages on the left, positioned in the footer area). Supports two numbering styles: `"Page X of Y"` text, or a bare standalone number (configurable, see below). Cover/back-cover pages can be exempted from requiring a printed number. If your document has no dedicated footer margin, `bare_number_position_rule: "last_on_page"` detects the number as whichever digit sits lowest on each page instead of requiring it in a fixed bottom-of-page zone.
 2. **Text Encoding / Garbled Text Verification** — flags pages where a font/encoding problem (e.g. a swapped font whose character codes no longer map to the correct glyphs) has produced unreadable text: the Unicode replacement character, stray control bytes, Private-Use-Area/box-drawing glyphs (FAIL), or an unusually high count of `?` / `<` / `>` characters or repeated symbol runs like `???`/`<<<` (WARN)
 3. **Manufacturer Symbol Verification** — confirms the ISO 7000-3082 "Manufacturer" factory pictogram is present on the required page (last page by default) using real image template matching, since the symbol is graphics, not text. Skips itself with a WARN if the optional image-processing dependencies aren't installed.
 4. **CE Marking Verification** — confirms the CE conformity marking is present on the required page (last page by default), also via image template matching. Either the bare "CE" mark or "CE" + a notified body number (e.g. "CE0344") is accepted.
@@ -37,9 +37,10 @@ python run.py path/to/any/document.pdf
 Edit `config.py` — this is the only file you should need to touch to adapt the checker. It holds:
 
 - **`page_number_mode`** — `"labeled"` for `"Page X of Y"` text, or `"bare_number"` for a standalone digit with no wording (uses word coordinates, restricted to the footer zone)
+- **`bare_number_position_rule`** — (bare_number mode only) `"footer_zone"` (default) requires the number within the bottom `footer_zone_ratio` of the page; `"last_on_page"` instead takes whichever digit sits lowest on the page, for documents with no dedicated footer margin. Pages listed in `unnumbered_pages` are skipped entirely under `"last_on_page"` so trailing digits there (addresses, dates, catalog numbers) can't be misread as a page number.
 - **`unnumbered_pages`** — pages allowed to have no printed number at all (e.g. `["first", "last"]` for a cover and back-cover page)
 - Expected `Page X of Y` pattern
-- **Odd/even footer placement rule** — `enforce_left_right_placement` (on by default: odd pages must be right-aligned in the footer, even pages left-aligned) and `footer_zone_ratio` (how close to the bottom of the page counts as "footer")
+- **Odd/even footer placement rule** — `enforce_left_right_placement` (on by default: odd pages must be right-aligned in the footer, even pages left-aligned) and `footer_zone_ratio` (how close to the bottom of the page counts as "footer"; ignored when `bare_number_position_rule` is `"last_on_page"`, since there's no fixed footer to check against — only the left/right side rule still applies)
 - **`garbled_symbol_warn_threshold`** — how many `?`/`<`/`>` characters on a single page trigger a garbled-text WARN (default `5`)
 - **`require_manufacturer_symbol`** — turn the manufacturer-symbol check on/off (default `True`)
 - **`manufacturer_symbol_page`** — which page must carry the symbol: `"last"` (default), `"first"`, or a specific 1-indexed page int
