@@ -4,6 +4,7 @@ IFU (Instructions for Use) QC Automation — core checker logic.
 Implements the checklist:
   1. Page Number Verification
   2. Text Encoding / Garbled Text Verification
+  3. Manufacturer Symbol Verification
 """
 
 import re
@@ -535,9 +536,101 @@ class IFUQualityChecker:
                 )
 
     # ------------------------------------------------------
+    # 3. Manufacturer Symbol Verification
+    # ------------------------------------------------------
+    def check_manufacturer_symbol(self):
+        """
+        Confirms the ISO 7000-3082 "Manufacturer" pictogram (factory
+        icon) is present on the required page (last page by default).
+        This is graphical shape detection via image template matching
+        against a reference PNG, not a text/caption search — the symbol
+        is graphics, and may be embedded as a raster image or drawn as
+        vector art with no accompanying text at all.
+        """
+        if not self.config.get("require_manufacturer_symbol", False):
+            return
+
+        try:
+            import pymupdf
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.report.add(
+                "3. Manufacturer Symbol", "WARN",
+                "Manufacturer-symbol check skipped — install pymupdf, "
+                "opencv-python and numpy (see requirements.txt) to enable "
+                "image-based symbol detection"
+            )
+            return
+
+        total_pages = len(self.pages_text)
+        location = self.config.get("manufacturer_symbol_page", "last")
+        if location == "last":
+            target_idx = total_pages
+        elif location == "first":
+            target_idx = 1
+        elif isinstance(location, int) and 1 <= location <= total_pages:
+            target_idx = location
+        else:
+            target_idx = total_pages
+
+        template_path = self.config.get("manufacturer_symbol_template") or (
+            Path(__file__).resolve().parent.parent
+            / "assets" / "manufacturer_symbol_template.png"
+        )
+        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            self.report.add(
+                "3. Manufacturer Symbol", "WARN",
+                f"Manufacturer-symbol check skipped — reference template "
+                f"image not found at '{template_path}'"
+            )
+            return
+
+        dpi = self.config.get("manufacturer_symbol_render_dpi", 150)
+        threshold = self.config.get("manufacturer_symbol_match_threshold", 0.6)
+
+        doc = pymupdf.open(self.pdf_path)
+        page = doc[target_idx - 1]
+        zoom = dpi / 72
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        page_gray = img[:, :, 0] if pix.n == 1 else cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
+        doc.close()
+
+        # The symbol's on-page size relative to the page is unknown, so
+        # try the template at several plausible sizes (as a fraction of
+        # page width) and keep the best match across all of them. Ratios
+        # below ~0.06 are excluded: at that size the resized template is
+        # only a few dozen pixels wide, and matching against mostly-blank
+        # page background spuriously scores high regardless of content.
+        best_score = -1.0
+        page_h, page_w = page_gray.shape
+        template_h, template_w = template.shape
+        for width_ratio in (0.07, 0.09, 0.12, 0.16, 0.20, 0.25):
+            resized_w = max(10, int(page_w * width_ratio))
+            resized_h = max(10, int(template_h * (resized_w / template_w)))
+            if resized_h >= page_h or resized_w >= page_w:
+                continue
+            resized = cv2.resize(template, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+            result = cv2.matchTemplate(page_gray, resized, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            best_score = max(best_score, max_val)
+
+        if best_score < threshold:
+            self.report.add(
+                "3. Manufacturer Symbol", "FAIL",
+                "Required manufacturer symbol (ISO 7000-3082 factory "
+                f"pictogram) not found on page {target_idx} "
+                f"(best match confidence {best_score:.2f}, need >= {threshold})",
+                page=target_idx
+            )
+
+    # ------------------------------------------------------
     def run_all(self):
         self.check_page_numbers()
         self.check_page_number_format_consistency()
         self.check_page_placement()
         self.check_text_encoding()
+        self.check_manufacturer_symbol()
         return self.report

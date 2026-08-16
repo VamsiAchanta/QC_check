@@ -13,15 +13,15 @@ IFUQualityChecker._load()          (src/ifu_qc_checker.py)
   → for each page: extract_text(), extract_words(), (width, height)
       │
       ▼
-pages_text[]     pages_words[]     pages_size[]
-      │                │                │
-      └───────┬────────┴────────┬───────┘
-              ▼                 ▼
-   check_page_numbers() ...   check_text_encoding()
-   check_page_number_format_consistency()
+pages_text[]     pages_words[]     pages_size[]     (+ raw PDF bytes for rendering)
+      │                │                │                      │
+      └───────┬────────┴────────┬───────┴──────────┬───────────┘
+              ▼                 ▼                   ▼
+   check_page_numbers() ...   check_text_encoding()   check_manufacturer_symbol()
+   check_page_number_format_consistency()             (pymupdf render + cv2 template match)
    check_page_placement()
-              │                 │
-              └────────┬────────┘
+              │                 │                   │
+              └────────┬────────┴─────────┬─────────┘
                        ▼
                   QCReport
                 (Issue list: category, severity, message, page)
@@ -40,6 +40,7 @@ def run_all(self):
     self.check_page_number_format_consistency()
     self.check_page_placement()
     self.check_text_encoding()
+    self.check_manufacturer_symbol()
     return self.report
 ```
 
@@ -148,7 +149,54 @@ Real output from `input_pdfs/test_scenario_undefined_text.pdf`:
    rendering garbled text due to a font/encoding problem (page 4)
 ```
 
-## 4. Report outputs
+## 4. Check 3 — Manufacturer Symbol Verification
+
+Category label in the report: `"3. Manufacturer Symbol"`.
+
+### 4.1 Why this needs real image detection
+
+The other two checks work entirely on `pages_text`/`pages_words` — text pdfplumber already extracted. This one can't: the required ISO 7000-3082 "Manufacturer" pictogram (a factory silhouette — three roof peaks merging into a chimney, see `assets/manufacturer_symbol_template.png`) is graphics, and may be drawn as a raster image or vector art with **no accompanying text at all**. There is nothing in `pages_text` to search. So `check_manufacturer_symbol()` renders the target page to an actual image and does image template matching, rather than reusing the text-extraction pipeline.
+
+### 4.2 Algorithm (`check_manufacturer_symbol`)
+
+Gated by `config["require_manufacturer_symbol"]`. Steps:
+
+1. Import `pymupdf`, `cv2` (OpenCV), `numpy` — all optional. If any is missing, add a **WARN** ("install pymupdf, opencv-python and numpy") and return; the check never hard-fails the run over a missing dependency.
+2. Resolve the target page from `config["manufacturer_symbol_page"]` (`"last"` by default, also accepts `"first"` or a 1-indexed int).
+3. Load the reference template — `config["manufacturer_symbol_template"]`, or the bundled `assets/manufacturer_symbol_template.png` if unset — as grayscale via `cv2.imread`. Missing file → WARN and return.
+4. Render just the target page to a raster image with `pymupdf` at `config["manufacturer_symbol_render_dpi"]` (default 150 DPI), converted to grayscale.
+5. **Multi-scale template match**: the symbol's size relative to the page isn't known ahead of time, so the template is resized to several candidate widths — `(0.07, 0.09, 0.12, 0.16, 0.20, 0.25)` × page width — and matched at each via `cv2.matchTemplate(..., cv2.TM_CCOEFF_NORMED)`. The highest score across all scales wins.
+
+```python
+for width_ratio in (0.07, 0.09, 0.12, 0.16, 0.20, 0.25):
+    resized_w = max(10, int(page_w * width_ratio))
+    resized_h = max(10, int(template_h * (resized_w / template_w)))
+    resized = cv2.resize(template, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+    result = cv2.matchTemplate(page_gray, resized, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(result)
+    best_score = max(best_score, max_val)
+```
+
+6. `best_score < config["manufacturer_symbol_match_threshold"]` (default `0.6`) → **FAIL**.
+
+**Why scales below ~0.06 are excluded:** at that size the resized template is only a few dozen pixels wide, and correlation against a mostly-blank page background scores misleadingly high regardless of whether the symbol is actually present — this was caught empirically (see below), not assumed.
+
+### 4.3 Threshold calibration
+
+The 0.6 threshold and the excluded small-scale range were both derived by measuring real match scores, not guessed. Two fixtures (§6) were built — one with the symbol embedded on the last page, one without — and matched at every scale:
+
+| width ratio | *with* symbol | *without* symbol |
+|---|---|---|
+| 0.07 | 0.642 | 0.462 |
+| 0.09 | **0.847** | 0.372 |
+| 0.12 | 0.804 | 0.320 |
+| 0.16 | 0.574 | 0.218 |
+| 0.20 | 0.402 | 0.155 |
+| 0.25 | 0.303 | 0.131 |
+
+The first attempt also included ratios `0.03`/`0.05`: those scored `0.588`/`0.568` on the *empty* page — high enough to falsely clear a 0.55 threshold — because at ~40px wide the template is mostly white margin, and white-on-white correlates well no matter what's underneath. Dropping those two scales and raising the threshold to 0.6 gives a clean, wide margin between the two fixtures (0.847 vs. 0.462) instead of a near-miss.
+
+## 5. Report outputs
 
 `QCReport` (dataclass, `src/ifu_qc_checker.py`) holds a flat list of `Issue(category, severity, message, page)` and renders it three ways:
 
@@ -158,7 +206,7 @@ Real output from `input_pdfs/test_scenario_undefined_text.pdf`:
 
 `run.py` exits non-zero if *any* processed PDF has `report.passed() == False`, so it can gate a CI pipeline directly.
 
-## 5. Configuration reference (`config.py`)
+## 6. Configuration reference (`config.py`)
 
 | Key | Code default (if key omitted) | This project's `config.py` value | Used by |
 |---|---|---|---|
@@ -169,10 +217,15 @@ Real output from `input_pdfs/test_scenario_undefined_text.pdf`:
 | `enforce_left_right_placement` | `False` | `True` | `check_page_placement` gate |
 | `footer_zone_ratio` | `0.85` | `0.85` | bare-number detection + placement footer check |
 | `garbled_symbol_warn_threshold` | `5` | `5` | `check_text_encoding` high-density rule |
+| `require_manufacturer_symbol` | `False` | `True` | `check_manufacturer_symbol` gate |
+| `manufacturer_symbol_page` | `"last"` | `"last"` | `check_manufacturer_symbol` target page |
+| `manufacturer_symbol_template` | *(bundled asset)* | `None` → bundled asset | `check_manufacturer_symbol` reference image |
+| `manufacturer_symbol_render_dpi` | `150` | `150` | page-render resolution |
+| `manufacturer_symbol_match_threshold` | `0.6` | `0.6` | minimum match confidence |
 
-## 6. Test fixtures
+## 7. Test fixtures
 
-Both fixtures live in `input_pdfs/` and were generated by one-off scripts (not committed — `input_pdfs/*.pdf` is gitignored) to exercise real extraction behavior, not just unit-test the regex in isolation.
+All fixtures live in `input_pdfs/` and were generated by one-off scripts (not committed — `input_pdfs/*.pdf` is gitignored) to exercise real extraction/rendering behavior, not just unit-test the regex or matching logic in isolation.
 
 ### `test_scenario_page_placement.pdf` (8 pages)
 
@@ -210,7 +263,11 @@ Page 2's content stream draws the raw byte codes `<01020304>` using this font. P
 
 All pages in both fixtures carry correctly-placed footer numbers, so every finding in each report is attributable only to the check under test — the Page Number check passes cleanly on the encoding fixture, and vice versa.
 
-## 7. Extending the checker
+### `test_scenario_manufacturer_symbol_present.pdf` / `..._missing.pdf` (2 pages each)
+
+A minimal pair used to calibrate and verify Check 3 in isolation. Both have an identical page 1 (ordinary body text) and page 2 (manufacturer name/address text). The *present* variant additionally draws `assets/manufacturer_symbol_template.png` onto page 2 at 10% of page width via `reportlab`'s `drawImage`; the *missing* variant doesn't. Running `check_manufacturer_symbol()` against each: `present` → no finding (best match 0.847, ≥ 0.6 threshold); `missing` → FAIL (best match 0.462). See §4.3 for the full per-scale score table these fixtures produced, which is what the threshold and excluded-scale-range were tuned against.
+
+## 8. Extending the checker
 
 To add a new check:
 

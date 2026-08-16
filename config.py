@@ -33,4 +33,23 @@ CONFIG = {
     # characters — a common symptom of a font/encoding problem where
     # character codes no longer map to the intended glyphs.
     "garbled_symbol_warn_threshold": 5,
+
+    # ---- 3. Manufacturer Symbol Verification ----
+    # Requires the pip extras `pymupdf`, `opencv-python`, `numpy`
+    # (see requirements.txt); the check WARNs and skips itself if they
+    # aren't installed rather than failing the run.
+    "require_manufacturer_symbol": True,
+    # Which page must carry the symbol: "last" (default), "first", or a
+    # specific 1-indexed page int.
+    "manufacturer_symbol_page": "last",
+    # Path to the reference symbol image used for template matching.
+    # None -> use the bundled assets/manufacturer_symbol_template.png
+    # (the standard ISO 7000-3082 "Manufacturer" factory pictogram).
+    "manufacturer_symbol_template": None,
+    # Resolution (DPI) the target page is rendered at before matching.
+    "manufacturer_symbol_render_dpi": 150,
+    # Minimum normalized cross-correlation score (0-1) to count as a
+    # match. The template is tried at several sizes since the symbol's
+    # on-page size relative to the page isn't known in advance.
+    "manufacturer_symbol_match_threshold": 0.6,
 }

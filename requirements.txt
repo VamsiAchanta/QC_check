@@ -1,2 +1,8 @@
 pdfplumber>=0.10.0
 reportlab>=4.0.0
+
+# Manufacturer symbol check (image template matching) — the check
+# WARNs and skips itself if these aren't installed.
+pymupdf>=1.23.0
+opencv-python>=4.8.0
+numpy>=1.24.0
